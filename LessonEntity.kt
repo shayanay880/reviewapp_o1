@@ -7,14 +7,10 @@ import androidx.room.PrimaryKey
 data class LessonEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val title: String,
-
-    // NEW:
-    val projectId: Long = 1L, // default “General”
-
-    val box: Int = 1,
+    val projectId: Long = 1,
+    val box: Int = 1,                  // for UI: Step 1..5
     val dueAt: Long = System.currentTimeMillis(),
     val isManual: Boolean = false,
-
-    // NEW (for “Unseen → Learning → …” later)
-    val reviewCount: Int = 0
+    val reviewCount: Int = 0,
+    val fsrsCardJson: String? = null   // ✅ REQUIRED for FSRS
 )
