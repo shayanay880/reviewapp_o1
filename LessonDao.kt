@@ -21,6 +21,9 @@ interface LessonDao {
     @Query("SELECT COUNT(*) FROM lessons")
     suspend fun count(): Int
 
+    @Query("SELECT * FROM lessons WHERE projectId = :projectId ORDER BY dueAt ASC")
+    fun observeByProject(projectId: Long): Flow<List<LessonEntity>>
+
     @Insert
     suspend fun insert(entity: LessonEntity): Long
 
