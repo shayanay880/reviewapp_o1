@@ -7,11 +7,10 @@ import androidx.room.RoomDatabase
 
 @Database(
     entities = [LessonEntity::class, ProjectEntity::class],
-    version = 2,
+    version = 3, // ✅ bump from 2 to 3
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
-
     abstract fun lessonDao(): LessonDao
     abstract fun projectDao(): ProjectDao
 
@@ -23,10 +22,9 @@ abstract class AppDatabase : RoomDatabase() {
                 INSTANCE ?: Room.databaseBuilder(
                     context.applicationContext,
                     AppDatabase::class.java,
-                    "lessons.db"
+                    "review.db"
                 )
-                    // ✅ easy-mode upgrade (wipes old DB if schema changes)
-                    .fallbackToDestructiveMigration()
+                    .fallbackToDestructiveMigration() // ✅ easiest while developing
                     .build()
                     .also { INSTANCE = it }
             }
