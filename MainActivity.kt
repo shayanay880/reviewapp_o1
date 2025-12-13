@@ -7,10 +7,18 @@ import androidx.compose.ui.platform.LocalContext
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.LocalTime
-
+import androidx.lifecycle.ViewModelProvider
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
+import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.viewModelScope
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.runtime.rememberCoroutineScope
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
+import kotlinx.coroutines.flow.firstOrNull
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -71,103 +79,111 @@ data class State(
 )
 
 data class Item(val lesson: Lesson, val state: State)
+private fun LessonEntity.toItem(): Item =
+    Item(
+        lesson = Lesson(id = id, title = title),
+        state = State(lessonId = id, step = box, dueAt = dueAt, isManual = isManual)
+    )
+class Vm(private val dao: LessonDao) : ViewModel() {
 
-class Vm : ViewModel() {
-
-    private val daysForStep = listOf(1, 3, 5, 10, 20)
+    private val daysForBox = listOf(1, 3, 5, 10, 20)
     private val dayMs = 24L * 60L * 60L * 1000L
 
-    private var nextId = 1L
-    private val _items = mutableStateListOf<Item>()
-    val items: List<Item> get() = _items
+    // observe list for UI
+    val itemsFlow: Flow<List<Item>> =
+        dao.observeAll().map { list -> list.map { it.toItem() } }
+
+    fun observeItem(id: Long): Flow<Item?> =
+        dao.observeById(id).map { it?.toItem() }
 
     init {
-        addLesson("CXR interpretation")
-        addLesson("ECG basics")
+        // seed once (only first install)
+        viewModelScope.launch {
+            if (dao.count() == 0) {
+                dao.insert(LessonEntity(title = "CXR interpretation"))
+                dao.insert(LessonEntity(title = "ECG basics"))
+            }
+        }
     }
 
-    fun addLesson(title: String) {
-        val lesson = Lesson(nextId++, title.trim())
-        _items.add(Item(lesson, State(lesson.id)))
-        _items.sortBy { it.state.dueAt }
+    suspend fun addLesson(title: String) {
+        val t = title.trim()
+        if (t.isEmpty()) return
+        dao.insert(LessonEntity(title = t))
     }
 
-    fun get(id: Long) = _items.firstOrNull { it.lesson.id == id }
-
-    fun dueNow(now: Long = System.currentTimeMillis()) =
-        _items.filter { it.state.dueAt <= now }.sortedBy { it.state.dueAt }
-
-    fun setManualDue(id: Long, dueAt: Long) {
-        val idx = _items.indexOfFirst { it.lesson.id == id }
-        if (idx == -1) return
-        val old = _items[idx]
-        _items[idx] = old.copy(state = old.state.copy(dueAt = dueAt, isManual = true))
-        _items.sortBy { it.state.dueAt }
+    suspend fun updateLesson(id: Long, newTitle: String) {
+        val e = dao.getById(id) ?: return
+        dao.update(e.copy(title = newTitle.trim()))
     }
 
-    fun clearManualBackToAuto(id: Long) {
-        val idx = _items.indexOfFirst { it.lesson.id == id }
-        if (idx == -1) return
-
-        val old = _items[idx]
-        val step = old.state.step.coerceIn(1, 5)
-        val autoDue = System.currentTimeMillis() + daysForStep[step - 1] * dayMs
-
-        _items[idx] = old.copy(state = old.state.copy(dueAt = autoDue, isManual = false))
-        _items.sortBy { it.state.dueAt }
+    suspend fun deleteLesson(id: Long) {
+        dao.deleteById(id)
     }
 
-    fun rate(id: Long, rating: Rating) {
-        val index = _items.indexOfFirst { it.lesson.id == id }
-        if (index == -1) return
+    suspend fun setManualDue(id: Long, dueAt: Long) {
+        val e = dao.getById(id) ?: return
+        dao.update(e.copy(dueAt = dueAt, isManual = true))
+    }
 
-        val old = _items[index]
+    suspend fun clearManualBackToAuto(id: Long) {
+        val e = dao.getById(id) ?: return
+        val box = e.box.coerceIn(1, 5)
+        val autoDue = System.currentTimeMillis() + daysForBox[box - 1] * dayMs
+        dao.update(e.copy(dueAt = autoDue, isManual = false))
+    }
 
-        val newStep = when (rating) {
+    suspend fun rate(id: Long, rating: Rating): Item? {
+        val e = dao.getById(id) ?: return null
+
+        val newBox = when (rating) {
             Rating.AGAIN -> 1
-            Rating.HARD -> old.state.step
-            Rating.GOOD -> min(5, old.state.step + 1)
-            Rating.EASY -> min(5, old.state.step + 2)
+            Rating.HARD -> e.box
+            Rating.GOOD -> min(5, e.box + 1)
+            Rating.EASY -> min(5, e.box + 2)
         }
 
-        val newDue = System.currentTimeMillis() + daysForStep[newStep - 1] * dayMs
-
-        _items[index] = old.copy(
-            state = old.state.copy(step = newStep, dueAt = newDue, isManual = false)
-        )
-        _items.sortBy { it.state.dueAt }
+        val newDue = System.currentTimeMillis() + daysForBox[newBox - 1] * dayMs
+        val updated = e.copy(box = newBox, dueAt = newDue, isManual = false)
+        dao.update(updated)
+        return updated.toItem()
     }
 
-    fun updateLesson(id: Long, newTitle: String) {
-        val idx = _items.indexOfFirst { it.lesson.id == id }
-        if (idx == -1) return
-        val old = _items[idx]
-        _items[idx] = old.copy(lesson = old.lesson.copy(title = newTitle.trim()))
-    }
-
-    fun deleteLesson(id: Long) {
-        val idx = _items.indexOfFirst { it.lesson.id == id }
-        if (idx == -1) return
-        _items.removeAt(idx)
+    suspend fun firstDueNow(): Item? =
+        dao.getFirstDue(System.currentTimeMillis())?.toItem()
+}
+class VmFactory(private val dao: LessonDao) : ViewModelProvider.Factory {
+    override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T {
+        @Suppress("UNCHECKED_CAST")
+        return Vm(dao) as T
     }
 }
-
-
 @Composable
-fun App(vm: Vm = viewModel()) {
+fun App() {
     val nav = rememberNavController()
+    val ctx = LocalContext.current
+
+    val dao = remember { AppDatabase.get(ctx).lessonDao() }
+    val vm: Vm = viewModel(factory = VmFactory(dao))
+    val scope = rememberCoroutineScope()
+
+    val items by vm.itemsFlow.collectAsState(initial = emptyList())
+
+    val now = System.currentTimeMillis()
+    val dueNowList = items.filter { it.state.dueAt <= now }
+    val dueCount = dueNowList.size
 
     NavHost(nav, startDestination = "home") {
 
         composable("home") {
             Home(
-                items = vm.items,
-                dueCount = vm.dueNow().size,
+                items = items,
+                dueCount = dueCount,
                 onAdd = { nav.navigate("add") },
                 onOpen = { nav.navigate("review/$it") },
                 onEdit = { nav.navigate("edit/$it") },
                 onStartDue = {
-                    val first = vm.dueNow().firstOrNull()
+                    val first = dueNowList.firstOrNull()
                     if (first != null) nav.navigate("review/${first.lesson.id}")
                 }
             )
@@ -176,9 +192,11 @@ fun App(vm: Vm = viewModel()) {
         composable("add") {
             Add(
                 onBack = { nav.popBackStack() },
-                onSave = {
-                    vm.addLesson(it)
-                    nav.popBackStack()
+                onSave = { title ->
+                    scope.launch {
+                        vm.addLesson(title)
+                        nav.popBackStack()
+                    }
                 }
             )
         }
@@ -188,23 +206,31 @@ fun App(vm: Vm = viewModel()) {
             arguments = listOf(navArgument("id") { type = NavType.LongType })
         ) { entry ->
             val id = entry.arguments?.getLong("id") ?: 0L
-            val item = vm.get(id)
-            val ctx = LocalContext.current
+            val item = items.firstOrNull { it.lesson.id == id }
+
             if (item == null) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Not found") }
             } else {
                 Review(
                     item = item,
-                    dueNowCount = vm.dueNow().size,
+                    dueNowCount = dueCount,
                     onBack = { nav.popBackStack() },
                     onRate = { r ->
-                        vm.rate(id, r)
-                        vm.get(id)?.let { updated ->
-                            NotificationScheduler.schedule(ctx, updated.lesson.id, updated.lesson.title, updated.state.dueAt)
+                        scope.launch {
+                            val updated = vm.rate(id, r)
+                            if (updated != null) {
+                                NotificationScheduler.schedule(
+                                    ctx,
+                                    updated.lesson.id,
+                                    updated.lesson.title,
+                                    updated.state.dueAt
+                                )
+                            }
+
+                            val next = vm.firstDueNow()
+                            if (next != null) nav.navigate("review/${next.lesson.id}") { popUpTo("home") }
+                            else nav.navigate("home") { popUpTo("home") { inclusive = true } }
                         }
-                        val next = vm.dueNow().firstOrNull()
-                        if (next != null) nav.navigate("review/${next.lesson.id}") { popUpTo("home") }
-                        else nav.navigate("home") { popUpTo("home") { inclusive = true } }
                     }
                 )
             }
@@ -215,8 +241,8 @@ fun App(vm: Vm = viewModel()) {
             arguments = listOf(navArgument("id") { type = NavType.LongType })
         ) { entry ->
             val id = entry.arguments?.getLong("id") ?: 0L
-            val item = vm.get(id)
-            val ctx = LocalContext.current
+            val item = items.firstOrNull { it.lesson.id == id }
+
             if (item == null) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Not found") }
             } else {
@@ -225,36 +251,47 @@ fun App(vm: Vm = viewModel()) {
                     dueAt = item.state.dueAt,
                     isManual = item.state.isManual,
                     onBack = { nav.popBackStack() },
+
                     onSave = { newTitle ->
-                        vm.updateLesson(id, newTitle)
-                        vm.get(id)?.let { updated ->
-                            // update alarm text too
-                            NotificationScheduler.schedule(ctx, updated.lesson.id, updated.lesson.title, updated.state.dueAt)
+                        scope.launch {
+                            vm.updateLesson(id, newTitle)
+                            // dueAt didn’t change, but title might → reschedule with new title
+                            NotificationScheduler.schedule(ctx, id, newTitle.trim(), item.state.dueAt)
+                            nav.popBackStack()
                         }
-                        nav.popBackStack()
                     },
+
                     onSetManualDue = { millis ->
-                        vm.setManualDue(id, millis)
-                        vm.get(id)?.let { updated ->
-                            NotificationScheduler.schedule(ctx, updated.lesson.id, updated.lesson.title, updated.state.dueAt)
+                        scope.launch {
+                            vm.setManualDue(id, millis)
+                            NotificationScheduler.schedule(ctx, id, item.lesson.title, millis)
                         }
                     },
+
                     onClearManual = {
-                        vm.clearManualBackToAuto(id)
-                        vm.get(id)?.let { updated ->
-                            NotificationScheduler.schedule(ctx, updated.lesson.id, updated.lesson.title, updated.state.dueAt)
+                        scope.launch {
+                            vm.clearManualBackToAuto(id)
+                            // after switching back to auto, the dueAt changes; simplest is to re-query:
+                            val refreshed = vm.observeItem(id).firstOrNull()
+                            if (refreshed != null) {
+                                NotificationScheduler.schedule(ctx, id, refreshed.lesson.title, refreshed.state.dueAt)
+                            }
                         }
                     },
+
                     onDelete = {
-                        NotificationScheduler.cancel(ctx, id)
-                        vm.deleteLesson(id)
-                        nav.navigate("home") { popUpTo("home") { inclusive = true } }
+                        scope.launch {
+                            NotificationScheduler.cancel(ctx, id)
+                            vm.deleteLesson(id)
+                            nav.navigate("home") { popUpTo("home") { inclusive = true } }
+                        }
                     }
                 )
             }
         }
     }
 }
+
 
 @Composable
 fun Home(
