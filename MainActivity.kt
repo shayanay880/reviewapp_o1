@@ -2,11 +2,15 @@
 
 package com.example.v12
 
+import android.Manifest
 import android.app.DatePickerDialog
 import android.app.TimePickerDialog
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -17,11 +21,13 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.platform.LocalContext
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavType
 import androidx.navigation.compose.*
@@ -31,63 +37,68 @@ import io.github.openspacedrepetition.Scheduler
 import io.github.openspacedrepetition.Rating as FsrsRating
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.time.Duration
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Calendar
-import kotlin.math.min
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.CoroutineScope
+import kotlin.math.max
 
 class MainActivity : ComponentActivity() {
+
+    private val notifPermLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* ignore */ }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Ask for POST_NOTIFICATIONS on Android 13+
+        if (Build.VERSION.SDK_INT >= 33) {
+            val granted = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!granted) notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
         setContent { MaterialTheme { App() } }
     }
 }
 
-/** Your UI ratings */
+/** UI ratings */
 enum class Rating { AGAIN, HARD, GOOD, EASY }
 
 data class Lesson(val id: Long, val title: String)
+
 data class State(
     val lessonId: Long,
-    val step: Int = 1,                  // Step 1..5 (UI only)
+    val step: Int = 1,                  // unlimited (we increment/decrement; no cap)
     val dueAt: Long = System.currentTimeMillis(),
     val isManual: Boolean = false,
     val reviewCount: Int = 0,
     val fsrsCardJson: String? = null
 )
+
 data class Item(val lesson: Lesson, val state: State)
 
-/** --- FSRS scheduler config (method 2) --- */
-private fun buildScheduler(): Scheduler {
+/** --- FSRS scheduler config --- */
+private fun buildScheduler(enableFuzzing: Boolean): Scheduler {
     return Scheduler.builder()
-        .desiredRetention(0.9)                 // common default in FSRS world :contentReference[oaicite:2]{index=2}
-        .learningSteps(emptyArray<Duration>()) // disable minute-based steps :contentReference[oaicite:3]{index=3}
+        .desiredRetention(0.90)
+        .enableFuzzing(enableFuzzing)
+        .learningSteps(emptyArray<Duration>())     // “topics” style: no minute steps
         .relearningSteps(emptyArray<Duration>())
-        .enableFuzzing(true)
+        .maximumInterval(36500)                    // ~100 years cap
         .build()
 }
 
 private fun loadCard(json: String?): Card {
     return try {
-        if (json.isNullOrBlank()) Card.builder().build()
-        else Card.fromJson(json)
+        if (json.isNullOrBlank()) Card.builder().build() else Card.fromJson(json)
     } catch (_: Throwable) {
         Card.builder().build()
-    }
-}
-
-private fun stepFromReviewCount(rc: Int): Int {
-    return when {
-        rc <= 0 -> 1
-        rc == 1 -> 2
-        rc in 2..3 -> 3
-        rc in 4..6 -> 4
-        else -> 5
     }
 }
 
@@ -107,24 +118,34 @@ private fun LessonEntity.toItem(): Item {
 
 class Vm(
     private val appContext: android.content.Context,
-    private val lessonDao: LessonDao,
-    private val projectDao: ProjectDao
+    private val lessonDao: LessonDao
 ) : ViewModel() {
 
-    private val scheduler: Scheduler = buildScheduler()
+    // Use fuzzing for REAL scheduling (more natural distribution)
+    private val scheduler: Scheduler = buildScheduler(enableFuzzing = true)
 
     val itemsFlow = lessonDao.observeAll().map { list ->
         list.map { it.toItem() }.sortedBy { it.state.dueAt }
     }
 
-    suspend fun addLesson(title: String) = withContext(Dispatchers.IO) {
+    init {
+        // Seed only if empty (optional, remove if you don’t want defaults)
+        viewModelScope.launch(Dispatchers.IO) {
+            if (lessonDao.count() == 0) {
+                addLessonInternal("CXR interpretation")
+                addLessonInternal("ECG basics")
+            }
+        }
+    }
+
+    private suspend fun addLessonInternal(title: String) {
         val clean = title.trim()
-        if (clean.isEmpty()) return@withContext
+        if (clean.isEmpty()) return
 
         val card = Card.builder().build()
         val entity = LessonEntity(
             title = clean,
-            projectId = 1,
+            projectId = 1L,
             box = 1,
             dueAt = System.currentTimeMillis(),
             isManual = false,
@@ -132,11 +153,23 @@ class Vm(
             fsrsCardJson = card.toJson()
         )
         lessonDao.insert(entity)
+        // No notification on add (otherwise “due now” would pop instantly).
+    }
+
+    suspend fun addLesson(title: String) = withContext(Dispatchers.IO) {
+        addLessonInternal(title)
     }
 
     suspend fun updateLessonTitle(id: Long, newTitle: String) = withContext(Dispatchers.IO) {
         val e = lessonDao.getById(id) ?: return@withContext
-        lessonDao.update(e.copy(title = newTitle.trim()))
+        val clean = newTitle.trim()
+        if (clean.isEmpty()) return@withContext
+
+        val updated = e.copy(title = clean)
+        lessonDao.update(updated)
+
+        // Update notification text (same time, new title)
+        NotificationScheduler.schedule(appContext, updated.id, updated.title, updated.dueAt)
     }
 
     suspend fun deleteLesson(id: Long) = withContext(Dispatchers.IO) {
@@ -146,7 +179,12 @@ class Vm(
 
     suspend fun setManualDue(id: Long, atMillis: Long) = withContext(Dispatchers.IO) {
         val e = lessonDao.getById(id) ?: return@withContext
-        val updated = e.copy(dueAt = atMillis, isManual = true)
+
+        // Prevent confusing “past time” picks: clamp to now + 1s
+        val minDue = System.currentTimeMillis() + 1_000
+        val clamped = max(atMillis, minDue)
+
+        val updated = e.copy(dueAt = clamped, isManual = true)
         lessonDao.update(updated)
         NotificationScheduler.schedule(appContext, updated.id, updated.title, updated.dueAt)
     }
@@ -154,6 +192,7 @@ class Vm(
     suspend fun clearManualBackToAuto(id: Long) = withContext(Dispatchers.IO) {
         val e = lessonDao.getById(id) ?: return@withContext
         val card = loadCard(e.fsrsCardJson)
+
         val autoDue = card.getDue().toEpochMilli()
         val updated = e.copy(dueAt = autoDue, isManual = false)
         lessonDao.update(updated)
@@ -163,38 +202,46 @@ class Vm(
     suspend fun rate(id: Long, rating: Rating) = withContext(Dispatchers.IO) {
         val e = lessonDao.getById(id) ?: return@withContext
 
-        val fsrsRating = FsrsRating.valueOf(rating.name) // AGAIN/HARD/GOOD/EASY :contentReference[oaicite:4]{index=4}
+        val fsrsRating = FsrsRating.valueOf(rating.name)
         val oldCard = loadCard(e.fsrsCardJson)
-        val result = scheduler.reviewCard(oldCard, fsrsRating)
-        val newCard = result.card()
-        val newDue = newCard.getDue().toEpochMilli()
+        val newCard = scheduler.reviewCard(oldCard, fsrsRating).card()
+        val newDueAt = newCard.getDue().toEpochMilli()
 
         val newReviewCount = e.reviewCount + 1
-        val newBox = stepFromReviewCount(newReviewCount)
+
+        // Infinite step counter (UI only)
+        val stepDelta = when (rating) {
+            Rating.AGAIN -> -1   // change to 0 if you never want step to drop
+            Rating.HARD -> 0
+            Rating.GOOD -> 1
+            Rating.EASY -> 2
+        }
+        val newStep = (e.box + stepDelta).coerceAtLeast(1)
 
         val updated = e.copy(
-            box = newBox,
-            dueAt = newDue,
+            dueAt = newDueAt,
             isManual = false,
             reviewCount = newReviewCount,
+            box = newStep,
             fsrsCardJson = newCard.toJson()
         )
         lessonDao.update(updated)
 
-        // schedule reminder for the next due time
+        // Schedule reminder for next due time
         NotificationScheduler.schedule(appContext, updated.id, updated.title, updated.dueAt)
     }
 
-    suspend fun firstDueNowId(now: Long = System.currentTimeMillis()): Long? = withContext(Dispatchers.IO) {
-        lessonDao.getFirstDue(now)?.id
-    }
+    suspend fun firstDueNowId(now: Long = System.currentTimeMillis()): Long? =
+        withContext(Dispatchers.IO) { lessonDao.getFirstDue(now)?.id }
 }
 
-class VmFactory(private val appContext: android.content.Context, private val db: AppDatabase) :
-    ViewModelProvider.Factory {
+class VmFactory(
+    private val appContext: android.content.Context,
+    private val db: AppDatabase
+) : ViewModelProvider.Factory {
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         @Suppress("UNCHECKED_CAST")
-        return Vm(appContext, db.lessonDao(), db.projectDao()) as T
+        return Vm(appContext, db.lessonDao()) as T
     }
 }
 
@@ -209,7 +256,8 @@ fun App() {
     val nav = rememberNavController()
     val scope = rememberCoroutineScope()
 
-    fun dueCount(now: Long = System.currentTimeMillis()) = items.count { it.state.dueAt <= now }
+    fun dueCount(now: Long = System.currentTimeMillis()) =
+        items.count { it.state.dueAt <= now }
 
     NavHost(nav, startDestination = "home") {
 
@@ -396,13 +444,12 @@ fun Add(onBack: () -> Unit, onSave: (String) -> Unit) {
 
 @Composable
 fun Review(item: Item, dueNowCount: Int, onBack: () -> Unit, onRate: (Rating) -> Unit) {
-    val scheduler = remember { buildScheduler() }
+    // Preview scheduler WITHOUT fuzzing so the “Next:” labels don’t randomly change on recomposition.
+    val previewScheduler = remember { buildScheduler(enableFuzzing = false) }
     val baseCard = remember(item.state.fsrsCardJson) { loadCard(item.state.fsrsCardJson) }
 
-    fun previewDue(r: FsrsRating): Long {
-        val result = scheduler.reviewCard(baseCard, r)
-        return result.card().getDue().toEpochMilli()
-    }
+    fun previewDue(r: FsrsRating): Long =
+        previewScheduler.reviewCard(baseCard, r).card().getDue().toEpochMilli()
 
     val againDue = remember(item.lesson.id, item.state.fsrsCardJson) { previewDue(FsrsRating.AGAIN) }
     val hardDue = remember(item.lesson.id, item.state.fsrsCardJson) { previewDue(FsrsRating.HARD) }
@@ -460,6 +507,7 @@ fun EditScreen(
 
     fun pickManualDateTime() {
         val now = Calendar.getInstance()
+
         DatePickerDialog(
             ctx,
             { _, y, m, d ->
@@ -544,14 +592,10 @@ fun EditScreen(
                     title = { Text("Delete?") },
                     text = { Text("This will remove the topic and its reminder.") },
                     confirmButton = {
-                        TextButton(onClick = { confirmDelete = false; onDelete() }) {
-                            Text("Delete")
-                        }
+                        TextButton(onClick = { confirmDelete = false; onDelete() }) { Text("Delete") }
                     },
                     dismissButton = {
-                        TextButton(onClick = { confirmDelete = false }) {
-                            Text("Cancel")
-                        }
+                        TextButton(onClick = { confirmDelete = false }) { Text("Cancel") }
                     }
                 )
             }
@@ -560,7 +604,7 @@ fun EditScreen(
 }
 
 private val dueFormatter: DateTimeFormatter =
-    DateTimeFormatter.ofPattern("EEE, MMM d • HH:mm")
+    DateTimeFormatter.ofPattern("EEE, MMM d, yyyy • HH:mm")
 
 private fun formatDue(epochMillis: Long): String {
     return Instant.ofEpochMilli(epochMillis)
