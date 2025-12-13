@@ -84,57 +84,69 @@ private fun LessonEntity.toItem(): Item =
         lesson = Lesson(id = id, title = title),
         state = State(lessonId = id, step = box, dueAt = dueAt, isManual = isManual)
     )
-class Vm(private val dao: LessonDao) : ViewModel() {
+class Vm(
+    private val lessonDao: LessonDao,
+    private val projectDao: ProjectDao
+) : ViewModel() {
 
     private val daysForBox = listOf(1, 3, 5, 10, 20)
     private val dayMs = 24L * 60L * 60L * 1000L
 
     // observe list for UI
     val itemsFlow: Flow<List<Item>> =
-        dao.observeAll().map { list -> list.map { it.toItem() } }
+        lessonDao.observeAll().map { list -> list.map { it.toItem() } }
+
+    val projectsFlow: Flow<List<ProjectEntity>> =
+        projectDao.observeAll()
+
+    fun itemsByProjectFlow(projectId: Long): Flow<List<Item>> =
+        lessonDao.observeByProject(projectId).map { list -> list.map { it.toItem() } }
 
     fun observeItem(id: Long): Flow<Item?> =
-        dao.observeById(id).map { it?.toItem() }
+        lessonDao.observeById(id).map { it?.toItem() }
 
     init {
         // seed once (only first install)
         viewModelScope.launch {
-            if (dao.count() == 0) {
-                dao.insert(LessonEntity(title = "CXR interpretation"))
-                dao.insert(LessonEntity(title = "ECG basics"))
+            if (projectDao.count() == 0) {
+                projectDao.insert(ProjectEntity(id = 1, name = "General"))
+            }
+            if (lessonDao.count() == 0) {
+                lessonDao.insert(LessonEntity(title = "CXR interpretation", projectId = 1))
+                lessonDao.insert(LessonEntity(title = "ECG basics", projectId = 1))
             }
         }
     }
 
-    suspend fun addLesson(title: String) {
+    suspend fun addLesson(title: String, projectId: Long = 1L) {
         val t = title.trim()
         if (t.isEmpty()) return
-        dao.insert(LessonEntity(title = t))
+        lessonDao.insert(LessonEntity(title = t, projectId = projectId))
     }
 
     suspend fun updateLesson(id: Long, newTitle: String) {
-        val e = dao.getById(id) ?: return
-        dao.update(e.copy(title = newTitle.trim()))
+        val e = lessonDao.getById(id) ?: return
+        lessonDao.update(e.copy(title = newTitle.trim()))
     }
 
     suspend fun deleteLesson(id: Long) {
-        dao.deleteById(id)
+        lessonDao.deleteById(id)
     }
 
     suspend fun setManualDue(id: Long, dueAt: Long) {
-        val e = dao.getById(id) ?: return
-        dao.update(e.copy(dueAt = dueAt, isManual = true))
+        val e = lessonDao.getById(id) ?: return
+        lessonDao.update(e.copy(dueAt = dueAt, isManual = true))
     }
 
     suspend fun clearManualBackToAuto(id: Long) {
-        val e = dao.getById(id) ?: return
+        val e = lessonDao.getById(id) ?: return
         val box = e.box.coerceIn(1, 5)
         val autoDue = System.currentTimeMillis() + daysForBox[box - 1] * dayMs
-        dao.update(e.copy(dueAt = autoDue, isManual = false))
+        lessonDao.update(e.copy(dueAt = autoDue, isManual = false))
     }
 
     suspend fun rate(id: Long, rating: Rating): Item? {
-        val e = dao.getById(id) ?: return null
+        val e = lessonDao.getById(id) ?: return null
 
         val newBox = when (rating) {
             Rating.AGAIN -> 1
@@ -145,26 +157,28 @@ class Vm(private val dao: LessonDao) : ViewModel() {
 
         val newDue = System.currentTimeMillis() + daysForBox[newBox - 1] * dayMs
         val updated = e.copy(box = newBox, dueAt = newDue, isManual = false)
-        dao.update(updated)
+        lessonDao.update(updated)
         return updated.toItem()
     }
 
     suspend fun firstDueNow(): Item? =
-        dao.getFirstDue(System.currentTimeMillis())?.toItem()
+        lessonDao.getFirstDue(System.currentTimeMillis())?.toItem()
 }
-class VmFactory(private val dao: LessonDao) : ViewModelProvider.Factory {
-    override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T {
+
+class VmFactory(private val db: AppDatabase) : ViewModelProvider.Factory {
+    override fun <T : ViewModel> create(modelClass: Class<T>): T {
         @Suppress("UNCHECKED_CAST")
-        return Vm(dao) as T
+        return Vm(db.lessonDao(), db.projectDao()) as T
     }
 }
+
 @Composable
 fun App() {
     val nav = rememberNavController()
     val ctx = LocalContext.current
+    val db = remember { AppDatabase.get(ctx) }
+    val vm: Vm = viewModel(factory = VmFactory(db))
 
-    val dao = remember { AppDatabase.get(ctx).lessonDao() }
-    val vm: Vm = viewModel(factory = VmFactory(dao))
     val scope = rememberCoroutineScope()
 
     val items by vm.itemsFlow.collectAsState(initial = emptyList())
