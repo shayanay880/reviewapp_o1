@@ -1,28 +1,12 @@
 @file:OptIn(ExperimentalMaterial3Api::class)
 
 package com.example.v12
+
 import android.app.DatePickerDialog
 import android.app.TimePickerDialog
-import androidx.compose.ui.platform.LocalContext
-import java.time.LocalDate
-import java.time.LocalDateTime
-import java.time.LocalTime
-import androidx.lifecycle.ViewModelProvider
-import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.launch
-import androidx.compose.runtime.collectAsState
-import androidx.lifecycle.viewModelScope
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.runtime.rememberCoroutineScope
-import android.Manifest
-import android.content.pm.PackageManager
-import android.os.Build
-import kotlinx.coroutines.flow.firstOrNull
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -35,170 +19,212 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.core.content.ContextCompat
+import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavType
 import androidx.navigation.compose.*
 import androidx.navigation.navArgument
+import io.github.openspacedrepetition.Card
+import io.github.openspacedrepetition.Scheduler
+import io.github.openspacedrepetition.Rating as FsrsRating
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.withContext
+import java.time.Duration
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.Calendar
 import kotlin.math.min
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.CoroutineScope
 
 class MainActivity : ComponentActivity() {
-
-    private val notifPermLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* ignore */ }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        // Ask for POST_NOTIFICATIONS on Android 13+
-        if (Build.VERSION.SDK_INT >= 33) {
-            val granted = ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.POST_NOTIFICATIONS
-            ) == PackageManager.PERMISSION_GRANTED
-            if (!granted) notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-        }
-
         setContent { MaterialTheme { App() } }
     }
 }
 
+/** Your UI ratings */
 enum class Rating { AGAIN, HARD, GOOD, EASY }
 
 data class Lesson(val id: Long, val title: String)
-
 data class State(
     val lessonId: Long,
-    val step: Int = 1,
+    val step: Int = 1,                  // Step 1..5 (UI only)
     val dueAt: Long = System.currentTimeMillis(),
-    val isManual: Boolean = false
+    val isManual: Boolean = false,
+    val reviewCount: Int = 0,
+    val fsrsCardJson: String? = null
 )
-
 data class Item(val lesson: Lesson, val state: State)
-private fun LessonEntity.toItem(): Item =
-    Item(
-        lesson = Lesson(id = id, title = title),
-        state = State(lessonId = id, step = box, dueAt = dueAt, isManual = isManual)
+
+/** --- FSRS scheduler config (method 2) --- */
+private fun buildScheduler(): Scheduler {
+    return Scheduler.builder()
+        .desiredRetention(0.9)                 // common default in FSRS world :contentReference[oaicite:2]{index=2}
+        .learningSteps(emptyArray<Duration>()) // disable minute-based steps :contentReference[oaicite:3]{index=3}
+        .relearningSteps(emptyArray<Duration>())
+        .enableFuzzing(true)
+        .build()
+}
+
+private fun loadCard(json: String?): Card {
+    return try {
+        if (json.isNullOrBlank()) Card.builder().build()
+        else Card.fromJson(json)
+    } catch (_: Throwable) {
+        Card.builder().build()
+    }
+}
+
+private fun stepFromReviewCount(rc: Int): Int {
+    return when {
+        rc <= 0 -> 1
+        rc == 1 -> 2
+        rc in 2..3 -> 3
+        rc in 4..6 -> 4
+        else -> 5
+    }
+}
+
+private fun LessonEntity.toItem(): Item {
+    return Item(
+        lesson = Lesson(id, title),
+        state = State(
+            lessonId = id,
+            step = box,
+            dueAt = dueAt,
+            isManual = isManual,
+            reviewCount = reviewCount,
+            fsrsCardJson = fsrsCardJson
+        )
     )
+}
+
 class Vm(
+    private val appContext: android.content.Context,
     private val lessonDao: LessonDao,
     private val projectDao: ProjectDao
 ) : ViewModel() {
 
-    private val daysForBox = listOf(1, 3, 5, 10, 20)
-    private val dayMs = 24L * 60L * 60L * 1000L
+    private val scheduler: Scheduler = buildScheduler()
 
-    // observe list for UI
-    val itemsFlow: Flow<List<Item>> =
-        lessonDao.observeAll().map { list -> list.map { it.toItem() } }
-
-    val projectsFlow: Flow<List<ProjectEntity>> =
-        projectDao.observeAll()
-
-    fun itemsByProjectFlow(projectId: Long): Flow<List<Item>> =
-        lessonDao.observeByProject(projectId).map { list -> list.map { it.toItem() } }
-
-    fun observeItem(id: Long): Flow<Item?> =
-        lessonDao.observeById(id).map { it?.toItem() }
-
-    init {
-        // seed once (only first install)
-        viewModelScope.launch {
-            if (projectDao.count() == 0) {
-                projectDao.insert(ProjectEntity(id = 1, name = "General"))
-            }
-            if (lessonDao.count() == 0) {
-                lessonDao.insert(LessonEntity(title = "CXR interpretation", projectId = 1))
-                lessonDao.insert(LessonEntity(title = "ECG basics", projectId = 1))
-            }
-        }
+    val itemsFlow = lessonDao.observeAll().map { list ->
+        list.map { it.toItem() }.sortedBy { it.state.dueAt }
     }
 
-    suspend fun addLesson(title: String, projectId: Long = 1L) {
-        val t = title.trim()
-        if (t.isEmpty()) return
-        lessonDao.insert(LessonEntity(title = t, projectId = projectId))
+    suspend fun addLesson(title: String) = withContext(Dispatchers.IO) {
+        val clean = title.trim()
+        if (clean.isEmpty()) return@withContext
+
+        val card = Card.builder().build()
+        val entity = LessonEntity(
+            title = clean,
+            projectId = 1,
+            box = 1,
+            dueAt = System.currentTimeMillis(),
+            isManual = false,
+            reviewCount = 0,
+            fsrsCardJson = card.toJson()
+        )
+        lessonDao.insert(entity)
     }
 
-    suspend fun updateLesson(id: Long, newTitle: String) {
-        val e = lessonDao.getById(id) ?: return
+    suspend fun updateLessonTitle(id: Long, newTitle: String) = withContext(Dispatchers.IO) {
+        val e = lessonDao.getById(id) ?: return@withContext
         lessonDao.update(e.copy(title = newTitle.trim()))
     }
 
-    suspend fun deleteLesson(id: Long) {
+    suspend fun deleteLesson(id: Long) = withContext(Dispatchers.IO) {
+        NotificationScheduler.cancel(appContext, id)
         lessonDao.deleteById(id)
     }
 
-    suspend fun setManualDue(id: Long, dueAt: Long) {
-        val e = lessonDao.getById(id) ?: return
-        lessonDao.update(e.copy(dueAt = dueAt, isManual = true))
-    }
-
-    suspend fun clearManualBackToAuto(id: Long) {
-        val e = lessonDao.getById(id) ?: return
-        val box = e.box.coerceIn(1, 5)
-        val autoDue = System.currentTimeMillis() + daysForBox[box - 1] * dayMs
-        lessonDao.update(e.copy(dueAt = autoDue, isManual = false))
-    }
-
-    suspend fun rate(id: Long, rating: Rating): Item? {
-        val e = lessonDao.getById(id) ?: return null
-
-        val newBox = when (rating) {
-            Rating.AGAIN -> 1
-            Rating.HARD -> e.box
-            Rating.GOOD -> min(5, e.box + 1)
-            Rating.EASY -> min(5, e.box + 2)
-        }
-
-        val newDue = System.currentTimeMillis() + daysForBox[newBox - 1] * dayMs
-        val updated = e.copy(box = newBox, dueAt = newDue, isManual = false)
+    suspend fun setManualDue(id: Long, atMillis: Long) = withContext(Dispatchers.IO) {
+        val e = lessonDao.getById(id) ?: return@withContext
+        val updated = e.copy(dueAt = atMillis, isManual = true)
         lessonDao.update(updated)
-        return updated.toItem()
+        NotificationScheduler.schedule(appContext, updated.id, updated.title, updated.dueAt)
     }
 
-    suspend fun firstDueNow(): Item? =
-        lessonDao.getFirstDue(System.currentTimeMillis())?.toItem()
+    suspend fun clearManualBackToAuto(id: Long) = withContext(Dispatchers.IO) {
+        val e = lessonDao.getById(id) ?: return@withContext
+        val card = loadCard(e.fsrsCardJson)
+        val autoDue = card.getDue().toEpochMilli()
+        val updated = e.copy(dueAt = autoDue, isManual = false)
+        lessonDao.update(updated)
+        NotificationScheduler.schedule(appContext, updated.id, updated.title, updated.dueAt)
+    }
+
+    suspend fun rate(id: Long, rating: Rating) = withContext(Dispatchers.IO) {
+        val e = lessonDao.getById(id) ?: return@withContext
+
+        val fsrsRating = FsrsRating.valueOf(rating.name) // AGAIN/HARD/GOOD/EASY :contentReference[oaicite:4]{index=4}
+        val oldCard = loadCard(e.fsrsCardJson)
+        val result = scheduler.reviewCard(oldCard, fsrsRating)
+        val newCard = result.card()
+        val newDue = newCard.getDue().toEpochMilli()
+
+        val newReviewCount = e.reviewCount + 1
+        val newBox = stepFromReviewCount(newReviewCount)
+
+        val updated = e.copy(
+            box = newBox,
+            dueAt = newDue,
+            isManual = false,
+            reviewCount = newReviewCount,
+            fsrsCardJson = newCard.toJson()
+        )
+        lessonDao.update(updated)
+
+        // schedule reminder for the next due time
+        NotificationScheduler.schedule(appContext, updated.id, updated.title, updated.dueAt)
+    }
+
+    suspend fun firstDueNowId(now: Long = System.currentTimeMillis()): Long? = withContext(Dispatchers.IO) {
+        lessonDao.getFirstDue(now)?.id
+    }
 }
 
-class VmFactory(private val db: AppDatabase) : ViewModelProvider.Factory {
+class VmFactory(private val appContext: android.content.Context, private val db: AppDatabase) :
+    ViewModelProvider.Factory {
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         @Suppress("UNCHECKED_CAST")
-        return Vm(db.lessonDao(), db.projectDao()) as T
+        return Vm(appContext, db.lessonDao(), db.projectDao()) as T
     }
 }
 
 @Composable
 fun App() {
-    val nav = rememberNavController()
     val ctx = LocalContext.current
     val db = remember { AppDatabase.get(ctx) }
-    val vm: Vm = viewModel(factory = VmFactory(db))
-
-    val scope = rememberCoroutineScope()
+    val factory = remember { VmFactory(ctx.applicationContext, db) }
+    val vm: Vm = viewModel(factory = factory)
 
     val items by vm.itemsFlow.collectAsState(initial = emptyList())
+    val nav = rememberNavController()
+    val scope = rememberCoroutineScope()
 
-    val now = System.currentTimeMillis()
-    val dueNowList = items.filter { it.state.dueAt <= now }
-    val dueCount = dueNowList.size
+    fun dueCount(now: Long = System.currentTimeMillis()) = items.count { it.state.dueAt <= now }
 
     NavHost(nav, startDestination = "home") {
 
         composable("home") {
             Home(
                 items = items,
-                dueCount = dueCount,
+                dueCount = dueCount(),
                 onAdd = { nav.navigate("add") },
                 onOpen = { nav.navigate("review/$it") },
                 onEdit = { nav.navigate("edit/$it") },
                 onStartDue = {
-                    val first = dueNowList.firstOrNull()
-                    if (first != null) nav.navigate("review/${first.lesson.id}")
+                    scope.launch {
+                        val nextId = vm.firstDueNowId()
+                        if (nextId != null) nav.navigate("review/$nextId")
+                    }
                 }
             )
         }
@@ -227,23 +253,17 @@ fun App() {
             } else {
                 Review(
                     item = item,
-                    dueNowCount = dueCount,
+                    dueNowCount = dueCount(),
                     onBack = { nav.popBackStack() },
                     onRate = { r ->
                         scope.launch {
-                            val updated = vm.rate(id, r)
-                            if (updated != null) {
-                                NotificationScheduler.schedule(
-                                    ctx,
-                                    updated.lesson.id,
-                                    updated.lesson.title,
-                                    updated.state.dueAt
-                                )
+                            vm.rate(id, r)
+                            val nextId = vm.firstDueNowId()
+                            if (nextId != null) {
+                                nav.navigate("review/$nextId") { popUpTo("home") }
+                            } else {
+                                nav.navigate("home") { popUpTo("home") { inclusive = true } }
                             }
-
-                            val next = vm.firstDueNow()
-                            if (next != null) nav.navigate("review/${next.lesson.id}") { popUpTo("home") }
-                            else nav.navigate("home") { popUpTo("home") { inclusive = true } }
                         }
                     }
                 )
@@ -261,41 +281,22 @@ fun App() {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Not found") }
             } else {
                 EditScreen(
-                    initialTitle = item.lesson.title,
-                    dueAt = item.state.dueAt,
-                    isManual = item.state.isManual,
+                    item = item,
                     onBack = { nav.popBackStack() },
-
-                    onSave = { newTitle ->
+                    onSaveTitle = { newTitle ->
                         scope.launch {
-                            vm.updateLesson(id, newTitle)
-                            // dueAt didn’t change, but title might → reschedule with new title
-                            NotificationScheduler.schedule(ctx, id, newTitle.trim(), item.state.dueAt)
+                            vm.updateLessonTitle(id, newTitle)
                             nav.popBackStack()
                         }
                     },
-
-                    onSetManualDue = { millis ->
-                        scope.launch {
-                            vm.setManualDue(id, millis)
-                            NotificationScheduler.schedule(ctx, id, item.lesson.title, millis)
-                        }
+                    onSetManual = { atMillis ->
+                        scope.launch { vm.setManualDue(id, atMillis) }
                     },
-
                     onClearManual = {
-                        scope.launch {
-                            vm.clearManualBackToAuto(id)
-                            // after switching back to auto, the dueAt changes; simplest is to re-query:
-                            val refreshed = vm.observeItem(id).firstOrNull()
-                            if (refreshed != null) {
-                                NotificationScheduler.schedule(ctx, id, refreshed.lesson.title, refreshed.state.dueAt)
-                            }
-                        }
+                        scope.launch { vm.clearManualBackToAuto(id) }
                     },
-
                     onDelete = {
                         scope.launch {
-                            NotificationScheduler.cancel(ctx, id)
                             vm.deleteLesson(id)
                             nav.navigate("home") { popUpTo("home") { inclusive = true } }
                         }
@@ -305,7 +306,6 @@ fun App() {
         }
     }
 }
-
 
 @Composable
 fun Home(
@@ -317,7 +317,7 @@ fun Home(
     onStartDue: () -> Unit
 ) {
     Scaffold(
-        topBar = { TopAppBar(title = { Text("Lessons") }) },
+        topBar = { TopAppBar(title = { Text("Topics") }) },
         floatingActionButton = { FloatingActionButton(onClick = onAdd) { Text("+") } }
     ) { padding ->
         Column(
@@ -325,96 +325,20 @@ fun Home(
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Card {
-                Row(
-                    Modifier.padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+                Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("Due now: $dueCount", modifier = Modifier.weight(1f))
                     Button(onClick = onStartDue, enabled = dueCount > 0) { Text("Start") }
                 }
             }
 
-            if (items.isEmpty()) {
-                Text("No lessons yet. Tap + to add one.")
-            } else {
-                LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    items(items) { item ->
-                        LessonRow(
-                            item = item,
-                            onOpen = { onOpen(item.lesson.id) },
-                            onEdit = { onEdit(item.lesson.id) }
-                        )
-                    }
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                items(items) { item ->
+                    LessonRow(
+                        item = item,
+                        onOpen = { onOpen(item.lesson.id) },
+                        onEdit = { onEdit(item.lesson.id) }
+                    )
                 }
-            }
-        }
-    }
-}
-
-@Composable
-fun Add(onBack: () -> Unit, onSave: (String) -> Unit) {
-    var title by remember { mutableStateOf("") }
-
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Add lesson") },
-                navigationIcon = { TextButton(onClick = onBack) { Text("Back") } }
-            )
-        }
-    ) { padding ->
-        Column(
-            Modifier.padding(padding).fillMaxSize().padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            OutlinedTextField(
-                value = title,
-                onValueChange = { title = it },
-                label = { Text("Lesson title") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true
-            )
-            Button(
-                onClick = { onSave(title) },
-                enabled = title.trim().isNotEmpty()
-            ) { Text("Save") }
-        }
-    }
-}
-
-@Composable
-fun Review(item: Item, dueNowCount: Int, onBack: () -> Unit, onRate: (Rating) -> Unit) {
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Review") },
-                navigationIcon = { TextButton(onClick = onBack) { Text("Back") } }
-            )
-        }
-    ) { padding ->
-        Column(
-            Modifier.padding(padding).fillMaxSize().padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            Card {
-                Column(Modifier.padding(16.dp)) {
-                    Text(item.lesson.title, style = MaterialTheme.typography.headlineSmall)
-                    Text("Step ${item.state.step} • Next: ${formatDue(item.state.dueAt)}")
-                    Text("Due queue: $dueNowCount")
-                }
-            }
-
-            Button(onClick = { onRate(Rating.AGAIN) }, modifier = Modifier.fillMaxWidth()) {
-                Text("Very hard – review tomorrow")
-            }
-            OutlinedButton(onClick = { onRate(Rating.HARD) }, modifier = Modifier.fillMaxWidth()) {
-                Text("Hard – soon (2–3 days)")
-            }
-            Button(onClick = { onRate(Rating.GOOD) }, modifier = Modifier.fillMaxWidth()) {
-                Text("Good – later (5+ days)")
-            }
-            Button(onClick = { onRate(Rating.EASY) }, modifier = Modifier.fillMaxWidth()) {
-                Text("Very easy – much later")
             }
         }
     }
@@ -432,7 +356,8 @@ fun LessonRow(item: Item, onOpen: () -> Unit, onEdit: () -> Unit) {
         ) {
             Column(Modifier.weight(1f)) {
                 Text(item.lesson.title, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text("Step ${item.state.step} • Next: ${formatDue(item.state.dueAt)}")
+                val manualTag = if (item.state.isManual) " • Manual" else ""
+                Text("Step ${item.state.step}$manualTag • Next: ${formatDue(item.state.dueAt)}")
             }
             IconButton(onClick = onEdit) {
                 Icon(Icons.Filled.Edit, contentDescription = "Edit")
@@ -442,25 +367,13 @@ fun LessonRow(item: Item, onOpen: () -> Unit, onEdit: () -> Unit) {
 }
 
 @Composable
-fun EditScreen(
-    initialTitle: String,
-    dueAt: Long,
-    isManual: Boolean,
-    onBack: () -> Unit,
-    onSave: (String) -> Unit,
-    onSetManualDue: (Long) -> Unit,
-    onClearManual: () -> Unit,
-    onDelete: () -> Unit
-) {
-    val ctx = LocalContext.current
-
-    var title by remember { mutableStateOf(initialTitle) }
-    var confirmDelete by remember { mutableStateOf(false) }
+fun Add(onBack: () -> Unit, onSave: (String) -> Unit) {
+    var title by remember { mutableStateOf("") }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Edit lesson") },
+                title = { Text("Add topic") },
                 navigationIcon = { TextButton(onClick = onBack) { Text("Back") } }
             )
         }
@@ -472,86 +385,173 @@ fun EditScreen(
             OutlinedTextField(
                 value = title,
                 onValueChange = { title = it },
-                label = { Text("Lesson title") },
+                label = { Text("Topic name") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true
+            )
+            Button(onClick = { onSave(title) }, enabled = title.trim().isNotEmpty()) { Text("Save") }
+        }
+    }
+}
+
+@Composable
+fun Review(item: Item, dueNowCount: Int, onBack: () -> Unit, onRate: (Rating) -> Unit) {
+    val scheduler = remember { buildScheduler() }
+    val baseCard = remember(item.state.fsrsCardJson) { loadCard(item.state.fsrsCardJson) }
+
+    fun previewDue(r: FsrsRating): Long {
+        val result = scheduler.reviewCard(baseCard, r)
+        return result.card().getDue().toEpochMilli()
+    }
+
+    val againDue = remember(item.lesson.id, item.state.fsrsCardJson) { previewDue(FsrsRating.AGAIN) }
+    val hardDue = remember(item.lesson.id, item.state.fsrsCardJson) { previewDue(FsrsRating.HARD) }
+    val goodDue = remember(item.lesson.id, item.state.fsrsCardJson) { previewDue(FsrsRating.GOOD) }
+    val easyDue = remember(item.lesson.id, item.state.fsrsCardJson) { previewDue(FsrsRating.EASY) }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Review") },
+                navigationIcon = { TextButton(onClick = onBack) { Text("Back") } }
+            )
+        }
+    ) { padding ->
+        Column(
+            Modifier.padding(padding).fillMaxSize().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Card {
+                Column(Modifier.padding(16.dp)) {
+                    Text(item.lesson.title, style = MaterialTheme.typography.headlineSmall)
+                    Text("Now: Step ${item.state.step} • Queue: $dueNowCount")
+                    Text("Current due: ${formatDue(item.state.dueAt)}")
+                }
+            }
+
+            Button(onClick = { onRate(Rating.AGAIN) }, modifier = Modifier.fillMaxWidth()) {
+                Text("Relearn • Next: ${formatDue(againDue)}")
+            }
+            OutlinedButton(onClick = { onRate(Rating.HARD) }, modifier = Modifier.fillMaxWidth()) {
+                Text("Hard • Next: ${formatDue(hardDue)}")
+            }
+            Button(onClick = { onRate(Rating.GOOD) }, modifier = Modifier.fillMaxWidth()) {
+                Text("Good • Next: ${formatDue(goodDue)}")
+            }
+            Button(onClick = { onRate(Rating.EASY) }, modifier = Modifier.fillMaxWidth()) {
+                Text("Easy • Next: ${formatDue(easyDue)}")
+            }
+        }
+    }
+}
+
+@Composable
+fun EditScreen(
+    item: Item,
+    onBack: () -> Unit,
+    onSaveTitle: (String) -> Unit,
+    onSetManual: (Long) -> Unit,
+    onClearManual: () -> Unit,
+    onDelete: () -> Unit
+) {
+    val ctx = LocalContext.current
+    var title by remember { mutableStateOf(item.lesson.title) }
+    var confirmDelete by remember { mutableStateOf(false) }
+
+    fun pickManualDateTime() {
+        val now = Calendar.getInstance()
+        DatePickerDialog(
+            ctx,
+            { _, y, m, d ->
+                val now2 = Calendar.getInstance()
+                TimePickerDialog(
+                    ctx,
+                    { _, hh, mm ->
+                        val c = Calendar.getInstance().apply {
+                            set(Calendar.YEAR, y)
+                            set(Calendar.MONTH, m)
+                            set(Calendar.DAY_OF_MONTH, d)
+                            set(Calendar.HOUR_OF_DAY, hh)
+                            set(Calendar.MINUTE, mm)
+                            set(Calendar.SECOND, 0)
+                            set(Calendar.MILLISECOND, 0)
+                        }
+                        onSetManual(c.timeInMillis)
+                    },
+                    now2.get(Calendar.HOUR_OF_DAY),
+                    now2.get(Calendar.MINUTE),
+                    true
+                ).show()
+            },
+            now.get(Calendar.YEAR),
+            now.get(Calendar.MONTH),
+            now.get(Calendar.DAY_OF_MONTH)
+        ).show()
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Edit topic") },
+                navigationIcon = { TextButton(onClick = onBack) { Text("Back") } }
+            )
+        }
+    ) { padding ->
+        Column(
+            Modifier.padding(padding).fillMaxSize().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            OutlinedTextField(
+                value = title,
+                onValueChange = { title = it },
+                label = { Text("Topic name") },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true
             )
 
             Button(
-                onClick = { onSave(title) },
+                onClick = { onSaveTitle(title) },
                 enabled = title.trim().isNotEmpty(),
                 modifier = Modifier.fillMaxWidth()
-            ) { Text("Save changes") }
+            ) { Text("Save title") }
 
-            // ---- Manual scheduling section ----
             Card {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Next review", style = MaterialTheme.typography.titleMedium)
-                    Text(
-                        (if (isManual) "Manual: " else "Auto: ") + formatDue(dueAt)
-                    )
-
-                    Button(
-                        modifier = Modifier.fillMaxWidth(),
-                        onClick = {
-                            // start with current dueAt as defaults
-                            val zdt = Instant.ofEpochMilli(dueAt).atZone(ZoneId.systemDefault())
-                            val initDate = zdt.toLocalDate()
-                            val initTime = zdt.toLocalTime().withSecond(0).withNano(0)
-
-                            DatePickerDialog(
-                                ctx,
-                                { _, y, m, d ->
-                                    val pickedDate = LocalDate.of(y, m + 1, d)
-                                    TimePickerDialog(
-                                        ctx,
-                                        { _, hh, mm ->
-                                            val pickedTime = LocalTime.of(hh, mm)
-                                            val ldt = LocalDateTime.of(pickedDate, pickedTime)
-                                            val millis = ldt.atZone(ZoneId.systemDefault())
-                                                .toInstant()
-                                                .toEpochMilli()
-                                            onSetManualDue(millis)
-                                        },
-                                        initTime.hour,
-                                        initTime.minute,
-                                        true
-                                    ).show()
-                                },
-                                initDate.year,
-                                initDate.monthValue - 1,
-                                initDate.dayOfMonth
-                            ).show()
-                        }
-                    ) {
-                        Text("Set manual date & time")
-                    }
-
-                    OutlinedButton(
-                        modifier = Modifier.fillMaxWidth(),
-                        onClick = onClearManual,
-                        enabled = isManual
-                    ) {
-                        Text("Back to auto schedule")
-                    }
+                    Text("Next review: ${formatDue(item.state.dueAt)}")
+                    Text(if (item.state.isManual) "Reminder: Manual" else "Reminder: Auto (FSRS)")
                 }
             }
 
             OutlinedButton(
+                onClick = { pickManualDateTime() },
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Set manual reminder…") }
+
+            OutlinedButton(
+                onClick = { onClearManual() },
+                enabled = item.state.isManual,
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Back to auto scheduling") }
+
+            OutlinedButton(
                 onClick = { confirmDelete = true },
                 modifier = Modifier.fillMaxWidth()
-            ) { Text("Delete lesson") }
+            ) { Text("Delete topic") }
 
             if (confirmDelete) {
                 AlertDialog(
                     onDismissRequest = { confirmDelete = false },
                     title = { Text("Delete?") },
-                    text = { Text("This will remove the lesson.") },
+                    text = { Text("This will remove the topic and its reminder.") },
                     confirmButton = {
-                        TextButton(onClick = { confirmDelete = false; onDelete() }) { Text("Delete") }
+                        TextButton(onClick = { confirmDelete = false; onDelete() }) {
+                            Text("Delete")
+                        }
                     },
                     dismissButton = {
-                        TextButton(onClick = { confirmDelete = false }) { Text("Cancel") }
+                        TextButton(onClick = { confirmDelete = false }) {
+                            Text("Cancel")
+                        }
                     }
                 )
             }
@@ -559,11 +559,11 @@ fun EditScreen(
     }
 }
 
-
 private val dueFormatter: DateTimeFormatter =
     DateTimeFormatter.ofPattern("EEE, MMM d • HH:mm")
 
-private fun formatDue(epochMillis: Long): String =
-    Instant.ofEpochMilli(epochMillis)
+private fun formatDue(epochMillis: Long): String {
+    return Instant.ofEpochMilli(epochMillis)
         .atZone(ZoneId.systemDefault())
         .format(dueFormatter)
+}
