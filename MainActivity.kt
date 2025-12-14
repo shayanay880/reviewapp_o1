@@ -68,7 +68,8 @@ private fun buildScheduler(): Scheduler {
         .desiredRetention(0.9)                 // common default in FSRS world :contentReference[oaicite:2]{index=2}
         .learningSteps(emptyArray<Duration>()) // disable minute-based steps :contentReference[oaicite:3]{index=3}
         .relearningSteps(emptyArray<Duration>())
-        .enableFuzzing(true)
+        // Disable fuzzing so the "Next" preview matches the scheduled due time exactly.
+        .enableFuzzing(false)
         .build()
 }
 

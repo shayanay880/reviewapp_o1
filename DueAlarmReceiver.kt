@@ -11,6 +11,7 @@ import androidx.core.app.NotificationCompat
 
 class DueAlarmReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
+        val lessonId = intent.getLongExtra("lessonId", 0L)
         val title = intent.getStringExtra("title") ?: "Lesson"
         val channelId = "reviews_due"
 
@@ -37,6 +38,7 @@ class DueAlarmReceiver : BroadcastReceiver() {
             .setAutoCancel(true)
             .build()
 
-        nm.notify(title.hashCode(), n)
+        val notificationId = (lessonId % Int.MAX_VALUE).toInt().takeIf { it != 0 } ?: title.hashCode()
+        nm.notify(notificationId, n)
     }
 }
